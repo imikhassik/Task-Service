@@ -1,0 +1,54 @@
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "__pycache__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "migrations",
+    "settings.py",
+    "site-packages",
+    "venv",
+    "urls.py",
+]
+
+target-version = "py312"
+line-length = 88
+indent-width = 4
+
+[lint]
+# https://docs.astral.sh/ruff/rules/
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",   # Pyflakes
+    "S",   # bandit
+    ]
+
+ignore = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107", "D200", "D205", "D400", "F401"]
+
+[lint.per-file-ignores]
+"**/{tests,docs,tools}/*" = ["S"]
+
+[lint.pycodestyle]
+max-doc-length = 79

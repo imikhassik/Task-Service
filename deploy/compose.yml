@@ -1,0 +1,26 @@
+services:
+  {{APP}}:
+    image: $IMAGE
+    container_name: $CONTAINER_NAME
+    pull_policy: always
+    env_file:
+      - .env
+      - .service.env
+    volumes:
+      - ./.version:/.version:r
+      ### AUTH_LIB_PLACEHOLDER ###
+    restart: unless-stopped
+    ports:
+      - ${PORT}:80
+    deploy:
+      resources:
+        limits:
+          cpus: '0.1'
+          memory: 150M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "48m"
+        max-file: "3"
+        tag: "{{.Name}}"
+

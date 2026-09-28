@@ -1,0 +1,154 @@
+### VARIABLES ###
+variables:
+  PYTHON_VERSION: 'python:3.12.2'
+  GET_IP_SH: 'IyEvYmluL2Jhc2gKCmV4cG9ydCBhbGlhcz0ke0NJX1BST0pFQ1RfUEFUSF9TTFVHfQphbGlhc19hc19ieXRlYXJyYXk9JChlY2hvIC1uICRhbGlhcyB8IHNoYTI1NnN1bSB8IGhlYWQgLWMgOCB8IHh4ZCAtciAtcCB8IG9kIC1BbiAtdHUxIHwgdHIgJ1xuJyAnICcpCmFsaWFzX2FzX2J5dGVhcnJheT0oJGFsaWFzX2FzX2J5dGVhcnJheSkKYWxpYXNfYXNfYnl0ZWFycmF5WzBdPTEyNwpmaW5hbF9pcD0kKGVjaG8gJHthbGlhc19hc19ieXRlYXJyYXlbQF19IHwgYXdrICd7cHJpbnRmICIlZC4lZC4lZC4lZFxuIiwgJDEsICQyLCAkMywgJDR9JykKZWNobyAkZmluYWxfaXAKCg=='
+  HOST_MAIN_DIR: /srv/docker
+  HOST_PROJECT_DIR: ${HOST_MAIN_DIR}/${CI_PROJECT_PATH}
+  CONTAINER_IMAGE: ${CI_REGISTRY_IMAGE}:latest
+  CONTAINER_NAME: ${CI_PROJECT_PATH_SLUG}
+
+
+### TEMPLATES ###
+.ssh-add: &ssh-add
+  - eval $(ssh-agent -s) > /dev/null 2>&1
+  - echo $GATE_KEY | base64 -d | ssh-add - > /dev/null 2>&1
+  - echo $HOST_KEY | base64 -d | ssh-add - > /dev/null 2>&1
+
+### PIPELINE ###
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+stages:
+  - init
+  - test
+  - build
+  - deploy
+
+init_vars:
+  stage: init
+  variables:
+    PROJECTS: $CI_PROJECT_ID
+    PRIVATE_TOKEN: $INIT_TOKEN
+  trigger:
+    project: planka/cicd/env-init
+    strategy: depend
+
+
+init_pipeline:
+  stage: init
+  tags: [docker]
+  script: # Update docker credetionals
+    - echo CI_REGISTRY_IMAGE=$(echo $CI_REGISTRY_IMAGE | sed -r "s/(.*):8090(.*)/\1\2/") >> build.env
+    - echo CI_REGISTRY=$(echo $CI_REGISTRY | sed -r "s/(.*):8090(.*)/\1\2/") >> build.env
+    - echo SERVICE_IP=$(echo $GET_IP_SH | base64 -d | bash) >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+ruff-lint:
+  stage: test
+  tags: [docker]
+  allow_failure: true
+  variables:
+    BUILD_VERSION: $CI_COMMIT_SHORT_SHA
+  script:
+    - > #   Linter checks
+      docker create --rm --name lint-${CI_COMMIT_SHORT_SHA} -e CLICOLOR_FORCE=true ${DOCKER_HUB_MIRROR}${PYTHON_VERSION}-slim
+      bash -c "pip install ruff && ruff check --config /usr/src/app/ruff.toml /usr/src/app" > /dev/null &&
+      docker cp ./ lint-${CI_COMMIT_SHORT_SHA}:/usr/src/app > /dev/null
+    - docker start -a lint-${CI_COMMIT_SHORT_SHA}
+  after_script:
+    - docker rm -f lint-${CI_COMMIT_SHORT_SHA} || true
+    - if [ $(df / --output='pcent' | grep -o "[0-9]*") -gt 80 ]; then docker system prune -f; fi
+
+build-image:
+  stage: build
+  tags: [docker]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH =~ /^cicd.*/
+      when: manual
+  variables:
+    BUILD_VERSION: $CI_COMMIT_SHORT_SHA
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker pull $CI_REGISTRY_IMAGE:latest || true
+    - docker tag $CI_REGISTRY_IMAGE:latest $CI_REGISTRY_IMAGE:old || true
+    - docker push $CI_REGISTRY_IMAGE:old || true
+  script:
+    - > #   Image building commands
+      docker build --cache-from $CI_REGISTRY_IMAGE:old
+      --tag $CI_REGISTRY_IMAGE:latest
+      --build-arg PYTHON=${DOCKER_HUB_MIRROR}${PYTHON_VERSION}-alpine
+      --build-arg BUILD_VERSION=${BUILD_VERSION} .
+    - docker push $CI_REGISTRY_IMAGE:latest
+  after_script:
+    - if [ $(df / --output='pcent' | grep -o "[0-9]*") -gt 80 ]; then docker system prune -f; fi
+
+deploy-job:
+  stage: deploy
+  tags: [docker]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^cicd.*/
+      when: manual
+  variables:
+     DOCKER_COMPOSE_PORT: "${SERVICE_IP}:8080"
+  before_script:
+    - *ssh-add
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo $SERVICE_IP
+    - ssh -F $SSH_CONF deploy.host "mkdir -p ${HOST_PROJECT_DIR} || true"
+    - sed -ie "s/{{APP}}/${CI_PROJECT_PATH_SLUG}/g;" deploy/compose.yml
+    - > #   Check existence of special variables for libraries
+        if [ -f "$AUTH_FILE" ]; then
+            sed -i 's/### AUTH_LIB_PLACEHOLDER ###/- .\/auth.yml:\/config\/auth.yml/g' deploy/compose.yml;
+            rsync --delete -auzvpe "ssh -F $SSH_CONF" $AUTH_FILE deploy.host:"${HOST_PROJECT_DIR}/auth.yml";
+        else
+            sed -i 's/### AUTH_LIB_PLACEHOLDER ###//g' deploy/compose.yml;
+        fi
+    - rsync --delete -auzvpe "ssh -F $SSH_CONF" deploy/compose.yml deploy.host:${HOST_PROJECT_DIR}/compose.yml
+    - rsync --delete -auzvpe "ssh -F $SSH_CONF" $ENV_FILE deploy.host:${HOST_PROJECT_DIR}/.service.env
+    - > #   Set up environmental virables and start container
+      ssh -F $SSH_CONF deploy.host "
+        echo IMAGE=$CONTAINER_IMAGE > ${HOST_PROJECT_DIR}/.env &&
+        echo CONTAINER_NAME=$CONTAINER_NAME >> ${HOST_PROJECT_DIR}/.env &&
+        echo PORT=$DOCKER_COMPOSE_PORT >> ${HOST_PROJECT_DIR}/.env &&
+        echo -e '\n' >> ${HOST_PROJECT_DIR}/.service.env &&
+        echo ENVIRONMENT=$ENVIRONMENT >> ${HOST_PROJECT_DIR}/.service.env &&
+        echo '$TOKEN_SETTINGS' | base64 -d >> ${HOST_PROJECT_DIR}/.service.env &&
+        echo '$CI_COMMIT_SHORT_SHA' > ${HOST_PROJECT_DIR}/.version &&
+        sudo docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY &&
+        cd ${HOST_PROJECT_DIR} && sudo docker compose pull && sudo docker compose up -d "
+    - sed -ie "s/{{SERVICE_DOMAIN}}/${SERVICE_DOMAIN:=${CI_PROJECT_PATH_SLUG}.com}/g; s/{{SERVICE_IP}}/${SERVICE_IP}/g" deploy/nginx-template.conf
+    - rsync -auzvpe "ssh -F $SSH_CONF" deploy/nginx-template.conf deploy.host:${HOST_MAIN_DIR}/nginx-host/sites-enabled/${CI_PROJECT_PATH_SLUG}.conf
+    - ssh -F $SSH_CONF deploy.host 'sudo docker exec nginx-host nginx -t'
+    - ssh -F $SSH_CONF deploy.host 'sudo docker exec nginx-host nginx -s reload'
+
+push-to-prod:
+  stage: deploy
+  tags: [docker]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_BRANCH =~ /^cicd.*/
+      when: manual
+  variables:
+    PROD_REGISTRY: $CI_REGISTRY
+  before_script:
+    #   Try saving the most recent image for quick rollback
+    - docker login -u $PROD_REGISTRY_USER -p $PROD_REGISTRY_PASSWORD $PROD_REGISTRY
+    - docker pull $PROD_REGISTRY_REPO/$CI_PROJECT_NAME:latest || true
+    - docker tag $PROD_REGISTRY_REPO/$CI_PROJECT_NAME:latest $PROD_REGISTRY_REPO/$CI_PROJECT_NAME:old || true
+    - docker push $PROD_REGISTRY_REPO/$CI_PROJECT_NAME:old || true
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker pull $CI_REGISTRY_IMAGE:latest
+    - docker image tag $CI_REGISTRY_IMAGE:latest $PROD_REGISTRY_REPO/$CI_PROJECT_NAME:latest
+    - docker login -u $PROD_REGISTRY_USER -p $PROD_REGISTRY_PASSWORD $PROD_REGISTRY
+    - docker push $PROD_REGISTRY_REPO/$CI_PROJECT_NAME:latest
